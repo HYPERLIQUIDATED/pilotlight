@@ -1,0 +1,32 @@
+[package]
+name = "pilotlight"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytes = "1.12.1"
+const-hex = "1.19.1"
+http = "1.5.0"
+http-body-util = "0.1.5"
+hyper = { version = "1.11.0", default-features = false, features = ["client", "http2"] }
+hyper-util = { version = "0.1.20", default-features = false, features = ["tokio"] }
+rustls = { version = "0.23.43", default-features = false, features = ["aws-lc-rs", "std"] }
+rustls-pki-types = "1.15.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+tiny-keccak = { version = "2.0.2", features = ["keccak"] }
+tokio = { version = "1.53.1", default-features = false, features = ["net", "rt", "sync", "time"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["aws-lc-rs"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+webpki-roots = "1.0.9"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+
+[lints.rust]
+missing_docs = "deny"
