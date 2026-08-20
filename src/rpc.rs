@@ -11,6 +11,7 @@ use bytes::{BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::types::TxHash;
 
 /// Fixed fragments of the two submit payloads. The hex-encoded transaction is
 /// written between them, so a body costs one allocation and one hex pass.
@@ -81,22 +82,57 @@ struct RpcError {
     message: String,
 }
 
+/// Whether an error code is the sequencer's verdict on the transaction rather
+/// than a report about the call.
+///
+/// JSON-RPC reserves `-32000` to `-32099` for implementation-defined server
+/// errors, and EIP-1474 assigns meanings within it: `-32003` names a refused
+/// transaction, and Nitro uses `-32000` for one. The rest of the space
+/// describes the request or the server's ability to serve it, and an
+/// unrecognised code establishes nothing — reading it as a verdict would have
+/// the caller abandon a transaction that may never have been read.
+fn is_transaction_verdict(code: i64) -> bool {
+    matches!(code, -32000 | -32003)
+}
+
 /// Interpret a sequencer response to a submit call.
-pub(crate) fn parse_send_response(ip: IpAddr, body: &[u8]) -> Result<()> {
+///
+/// `expected` is the hash computed from the bytes that were sent. A successful
+/// response carries the hash the sequencer assigned, and the two must agree:
+/// anything else means the answer describes some other transaction, or came
+/// from something that is not this sequencer.
+pub(crate) fn parse_send_response(ip: IpAddr, body: &[u8], expected: TxHash) -> Result<()> {
     let env: Envelope = serde_json::from_slice(body).map_err(|e| Error::BadResponse {
         ip,
         message: format!("{e} (body: {})", truncate(body, 256)),
     })?;
 
     if let Some(err) = env.error {
-        return Err(Error::Rejected {
-            code: err.code,
-            message: err.message,
+        return Err(if is_transaction_verdict(err.code) {
+            Error::Rejected {
+                code: err.code,
+                message: err.message,
+            }
+        } else {
+            Error::Rpc {
+                code: err.code,
+                message: err.message,
+            }
         });
     }
 
     match env.result {
-        Some(_) => Ok(()),
+        Some(hash) => match hash.parse::<TxHash>() {
+            Ok(returned) if returned == expected => Ok(()),
+            Ok(returned) => Err(Error::BadResponse {
+                ip,
+                message: format!("accepted {returned} but {expected} was submitted"),
+            }),
+            Err(e) => Err(Error::BadResponse {
+                ip,
+                message: format!("`result` is not a transaction hash: {e} (got {hash})"),
+            }),
+        },
         None => Err(Error::BadResponse {
             ip,
             message: format!(

@@ -63,6 +63,29 @@ pub enum Error {
         message: String,
     },
 
+    /// The error carries no verdict on the transaction that this client can
+    /// read.
+    ///
+    /// It says nothing about what the sequencer did. An internal error can
+    /// arrive after the transaction was accepted, from a server that failed
+    /// while composing its answer, so the transaction may have been read,
+    /// accepted, both, or neither.
+    ///
+    /// These are retryable, since resending cannot include the transaction
+    /// twice. The exceptions are the codes that describe the request itself,
+    /// which will be refused the same way until the request changes.
+    #[error("sequencer RPC fault: [{code}] {message}")]
+    Rpc {
+        /// JSON-RPC error code.
+        ///
+        /// Usually one the specification defines, but any code that is not a
+        /// verdict on the transaction arrives here, including one this crate
+        /// does not recognise.
+        code: i64,
+        /// JSON-RPC error message.
+        message: String,
+    },
+
     /// The sequencer explicitly rejected the transaction.
     ///
     /// This is a definitive answer, not a retryable failure — every endpoint
@@ -101,14 +124,29 @@ impl Error {
     /// sequencer, so a rejection is final.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Error::Transport { .. }
-                | Error::HttpStatus { .. }
-                | Error::BadResponse { .. }
-                | Error::NotReady { .. }
-                | Error::Timeout(_)
-                | Error::AllFailed { .. }
-        )
+            | Error::HttpStatus { .. }
+            | Error::BadResponse { .. }
+            | Error::NotReady { .. }
+            | Error::Timeout(_)
+            | Error::AllFailed { .. } => true,
+
+            // A fault in the call says nothing about the transaction, so the
+            // submission is worth repeating — unless the fault is in the
+            // request itself, which will be refused the same way until it
+            // changes: unparseable, malformed, an unknown or unsupported
+            // method, bad parameters, a missing resource, or a protocol
+            // version this server does not speak.
+            Error::Rpc { code, .. } => !matches!(
+                code,
+                -32700 | -32600 | -32601 | -32602 | -32001 | -32004 | -32006
+            ),
+
+            Error::Config(_)
+            | Error::Dns { .. }
+            | Error::Rejected { .. }
+            | Error::InvalidRawTx(_) => false,
+        }
     }
 }

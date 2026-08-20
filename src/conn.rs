@@ -201,11 +201,17 @@ type Driver = tokio::task::JoinHandle<ClosedReason>;
 async fn establish(ip: IpAddr, cfg: &Config, tls: &Arc<ClientConfig>) -> Result<(Sender, Driver)> {
     let addr = SocketAddr::new(ip, cfg.port);
 
-    let tcp = tokio::time::timeout(cfg.connect_timeout, TcpStream::connect(addr))
+    // One budget covers both stages. Timing them separately would let a slow
+    // connect and a slow handshake each spend the full amount, so the wait
+    // could reach twice what the setting describes.
+    let deadline = crate::client::deadline_after(cfg.connect_timeout);
+    let left = || crate::client::time_left(deadline).unwrap_or(Duration::MAX);
+
+    let tcp = tokio::time::timeout(left(), TcpStream::connect(addr))
         .await
         .map_err(|_| Error::Transport {
             ip,
-            message: format!("TCP connect timed out after {:?}", cfg.connect_timeout),
+            message: format!("TCP connect exceeded the {:?} budget", cfg.connect_timeout),
         })?
         .map_err(|e| Error::Transport {
             ip,
@@ -231,13 +237,16 @@ async fn establish(ip: IpAddr, cfg: &Config, tls: &Arc<ClientConfig>) -> Result<
     })?;
 
     let tls_stream = tokio::time::timeout(
-        cfg.connect_timeout,
+        left(),
         TlsConnector::from(tls.clone()).connect(server_name, tcp),
     )
     .await
     .map_err(|_| Error::Transport {
         ip,
-        message: format!("TLS handshake timed out after {:?}", cfg.connect_timeout),
+        message: format!(
+            "TLS handshake exceeded the {:?} budget",
+            cfg.connect_timeout
+        ),
     })?
     .map_err(|e| Error::Transport {
         ip,

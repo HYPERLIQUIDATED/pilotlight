@@ -84,7 +84,7 @@ impl SequencerClient {
     /// [`Error::Timeout`] if no endpoint has a live connection within
     /// `timeout`. The client keeps trying to connect regardless.
     pub async fn wait_until_ready(&self, timeout: Duration) -> Result<()> {
-        let deadline = Instant::now() + timeout;
+        let deadline = deadline_after(timeout);
 
         loop {
             // Arm the notification *before* checking, so a connection that
@@ -97,12 +97,14 @@ impl SequencerClient {
                 return Ok(());
             }
 
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(Error::Timeout(timeout));
-            }
-            if tokio::time::timeout(remaining, notified).await.is_err() {
-                return Err(Error::Timeout(timeout));
+            match time_left(deadline) {
+                Some(remaining) if remaining.is_zero() => return Err(Error::Timeout(timeout)),
+                Some(remaining) => {
+                    if tokio::time::timeout(remaining, notified).await.is_err() {
+                        return Err(Error::Timeout(timeout));
+                    }
+                }
+                None => notified.await,
             }
         }
     }
@@ -252,7 +254,7 @@ impl SequencerClient {
             tokio::spawn(async move {
                 let at = Instant::now();
                 let outcome = match exchange(&conn, req, timeout).await {
-                    Ok(body) => rpc::parse_send_response(conn.ip, &body),
+                    Ok(body) => rpc::parse_send_response(conn.ip, &body, tx_hash),
                     Err(e) => Err(e),
                 };
 
@@ -275,7 +277,7 @@ impl SequencerClient {
 
         let endpoint = collect_verdict(
             &mut rx,
-            started + cfg.request_timeout,
+            started.checked_add(cfg.request_timeout),
             cfg.request_timeout,
             in_flight,
             all.len(),
@@ -289,6 +291,22 @@ impl SequencerClient {
             fanout: in_flight,
         })
     }
+}
+
+/// The instant a budget runs out, or `None` when it is too large to represent.
+///
+/// `None` means there is no deadline to enforce. Substituting the current
+/// instant would express the opposite — a deadline that has already passed —
+/// and turn an enormous budget into an immediate timeout.
+pub(crate) fn deadline_after(budget: Duration) -> Option<Instant> {
+    Instant::now().checked_add(budget)
+}
+
+/// How long is left, or `None` when there is no deadline.
+///
+/// `Some(ZERO)` means the deadline has passed.
+pub(crate) fn time_left(deadline: Option<Instant>) -> Option<Duration> {
+    deadline.map(|d| d.saturating_duration_since(Instant::now()))
 }
 
 /// Reduce the answers from a fan-out to the endpoint that carried the
@@ -306,7 +324,7 @@ impl SequencerClient {
 /// the transaction was never delivered.
 async fn collect_verdict(
     rx: &mut mpsc::Receiver<(IpAddr, Result<()>)>,
-    deadline: Instant,
+    deadline: Option<Instant>,
     budget: Duration,
     attempts: usize,
     known: usize,
@@ -315,16 +333,19 @@ async fn collect_verdict(
     let mut transport_failure: Option<Error> = None;
 
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(Error::Timeout(budget));
-        }
+        let answer = match time_left(deadline) {
+            Some(remaining) if remaining.is_zero() => return Err(Error::Timeout(budget)),
+            Some(remaining) => match tokio::time::timeout(remaining, rx.recv()).await {
+                Err(_) => return Err(Error::Timeout(budget)),
+                Ok(answer) => answer,
+            },
+            None => rx.recv().await,
+        };
 
-        match tokio::time::timeout(remaining, rx.recv()).await {
-            Err(_) => return Err(Error::Timeout(budget)),
-            Ok(None) => break,
-            Ok(Some((ip, Ok(())))) => return Ok(ip),
-            Ok(Some((_, Err(e)))) => {
+        match answer {
+            None => break,
+            Some((ip, Ok(()))) => return Ok(ip),
+            Some((_, Err(e))) => {
                 if e.is_retryable() {
                     transport_failure = Some(e);
                 } else {
@@ -569,7 +590,7 @@ impl ClientBuilder {
     /// Everything [`Self::build`] can return, plus [`Error::Timeout`] if no
     /// connection is warm before the budget expires.
     pub async fn connect(self) -> Result<SequencerClient> {
-        let warm_budget = self.cfg.connect_timeout * 2;
+        let warm_budget = self.cfg.connect_timeout.saturating_mul(2);
         let client = self.build().await?;
         client.wait_until_ready(warm_budget).await?;
         Ok(client)
@@ -608,7 +629,7 @@ mod tests {
         }
         drop(tx);
         let budget = Duration::from_secs(30);
-        collect_verdict(&mut rx, Instant::now() + budget, budget, attempts, known).await
+        collect_verdict(&mut rx, deadline_after(budget), budget, attempts, known).await
     }
 
     /// A rejection from one copy does not decide the fan-out.
