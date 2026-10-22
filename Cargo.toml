@@ -16,11 +16,11 @@ jsonrpsee-types = { version = "0.26.1", default-features = false }
 rustls = { version = "0.23.46", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
 serde_json = { version = "1.0.154", default-features = false, features = ["raw_value", "std"] }
 thiserror = { version = "2.0.21", default-features = false }
-tokio = { version = "1.53.3", default-features = false, features = ["macros", "net", "rt", "sync", "time"] }
+tokio = { version = "1.54.1", default-features = false, features = ["macros", "net", "rt", "sync", "time"] }
 tokio-rustls = { version = "0.26.6", default-features = false }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 url = { version = "2.5.8", default-features = false }
-webpki-roots = { version = "1.0.9", default-features = false }
+webpki-roots = { version = "1.0.10", default-features = false }
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }

@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use thiserror::Error;
 
@@ -6,7 +6,7 @@ use thiserror::Error;
 pub enum FailureKind {
     #[error("Connection unavailable")]
     Unavailable,
-    #[error("All connections to this IP are at capacity")]
+    #[error("Connection pool is at capacity")]
     Busy,
     #[error("Operation timed out")]
     Timeout,
@@ -31,6 +31,7 @@ pub struct EndpointFailure {
     /// Zero-based index in `Config::endpoints`. URL contents are never retained in errors.
     pub endpoint: usize,
     pub peer: Option<SocketAddr>,
+    pub local_ip: Option<IpAddr>,
     pub kind: FailureKind,
 }
 

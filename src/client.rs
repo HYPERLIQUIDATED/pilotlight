@@ -1,4 +1,12 @@
-use std::{fmt, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    net::IpAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use alloy_primitives::{B256, Bytes};
 use futures_util::{StreamExt, stream::FuturesUnordered};
@@ -19,6 +27,8 @@ pub struct Client {
 
 struct ClientInner {
     endpoints: Vec<Endpoint>,
+    local_ips: Arc<[Option<IpAddr>]>,
+    next_local_ip: AtomicUsize,
     request_timeout: Duration,
     initial_failures: Vec<EndpointFailure>,
 }
@@ -27,6 +37,7 @@ impl fmt::Debug for Client {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Client")
             .field("endpoints", &self.inner.endpoints.len())
+            .field("local_ips", &self.inner.local_ips)
             .field("request_timeout", &self.inner.request_timeout)
             .field("initial_failures", &self.inner.initial_failures)
             .finish()
@@ -34,19 +45,25 @@ impl fmt::Debug for Client {
 }
 
 impl Client {
-    /// Resolves every endpoint and establishes a pool of HTTP/2 connections per unique IP.
+    /// Resolves every endpoint and creates HTTP/2 pools for compatible local/remote IP pairs.
     /// At least one connection must succeed. Unavailable connections retry in the background.
     ///
     /// # Errors
     /// Returns sanitized configuration or connection failures.
     pub async fn connect(config: Config) -> Result<Self, ConnectError> {
-        let tls = connection::tls_config();
         config.validate()?;
+
+        let local_ips: Arc<[Option<IpAddr>]> = if config.local_ips.is_empty() {
+            Arc::from([None])
+        } else {
+            config.local_ips.into_iter().map(Some).collect()
+        };
         let targets: Vec<_> = config
             .endpoints
             .iter()
-            .map(|url| Target::parse(url))
+            .map(|url| Target::parse(url, Arc::clone(&local_ips)))
             .collect::<Result<_, _>>()?;
+        let tls = connection::tls_config();
         let mut endpoints = Vec::with_capacity(targets.len());
         let mut pending = FuturesUnordered::new();
         let deadline = Instant::now() + config.connect_timeout;
@@ -57,6 +74,7 @@ impl Client {
                 target,
                 tls.clone(),
                 ConnectionSettings {
+                    local_ip: None,
                     connect_timeout: config.connect_timeout,
                     reconnect_min_delay: config.reconnect_min_delay,
                     reconnect_max_delay: config.reconnect_max_delay,
@@ -82,7 +100,7 @@ impl Client {
             failures.extend(failed);
         }
 
-        failures.sort_unstable_by_key(|failure| (failure.endpoint, failure.peer));
+        failures.sort_unstable_by_key(|failure| (failure.endpoint, failure.local_ip, failure.peer));
 
         if !connected {
             return Err(ConnectError::NoConnections(failures));
@@ -91,6 +109,8 @@ impl Client {
         Ok(Self {
             inner: Arc::new(ClientInner {
                 endpoints,
+                local_ips,
+                next_local_ip: AtomicUsize::new(0),
                 request_timeout: config.request_timeout,
                 initial_failures: failures,
             }),
@@ -103,7 +123,8 @@ impl Client {
         &self.inner.initial_failures
     }
 
-    /// Broadcasts identical bytes concurrently; the first matching hash wins.
+    /// Rotates the starting source and checks each source at most once for available capacity.
+    /// Broadcasts identical bytes to its remote IPs concurrently; the first matching hash wins.
     /// Remaining local request futures are canceled. Already-submitted transactions cannot be undone.
     ///
     /// # Errors
@@ -115,20 +136,39 @@ impl Client {
         let mut pending = FuturesUnordered::new();
         let mut failures = Vec::new();
 
-        for endpoint in &self.inner.endpoints {
-            let pools = endpoint.snapshot();
+        let start =
+            self.inner.next_local_ip.fetch_add(1, Ordering::Relaxed) % self.inner.local_ips.len();
+        let (before, after) = self.inner.local_ips.split_at(start);
 
-            if pools.is_empty() {
-                failures.push(endpoint.unavailable());
+        for &local_ip in after.iter().chain(before) {
+            for endpoint in &self.inner.endpoints {
+                let pools = endpoint.snapshot();
+                let mut matched = false;
+
+                for pool in pools.iter().filter(|pool| pool.local_ip == local_ip) {
+                    matched = true;
+                    let reservation = match pool.reserve() {
+                        Ok(reservation) => reservation,
+                        Err(kind) => {
+                            failures.push(pool.failure(kind));
+                            continue;
+                        }
+                    };
+                    let pool = Arc::clone(pool);
+                    let body = body.clone();
+                    pending.push(async move {
+                        let response = pool.send(reservation, body, deadline).await?;
+                        rpc::decode_response(&response, hash).map_err(|kind| pool.failure(kind))
+                    });
+                }
+
+                if !matched {
+                    failures.push(endpoint.unavailable(local_ip));
+                }
             }
 
-            for pool in pools.iter() {
-                let pool = Arc::clone(pool);
-                let body = body.clone();
-                pending.push(async move {
-                    let response = pool.send(body, deadline).await?;
-                    rpc::decode_response(&response, hash).map_err(|kind| pool.failure(kind))
-                });
+            if !pending.is_empty() {
+                break;
             }
         }
 
@@ -139,7 +179,7 @@ impl Client {
             }
         }
 
-        failures.sort_unstable_by_key(|failure| (failure.endpoint, failure.peer));
+        failures.sort_unstable_by_key(|failure| (failure.endpoint, failure.local_ip, failure.peer));
         Err(BroadcastError::NoSuccess(failures))
     }
 }

@@ -1,4 +1,8 @@
-use std::{future::Future, net::SocketAddr, sync::Arc};
+use std::{
+    future::Future,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
 use bytes::Bytes;
 use futures_util::{StreamExt, stream::FuturesUnordered};
@@ -17,9 +21,24 @@ pub(crate) struct StartupReport {
     pub failures: Vec<EndpointFailure>,
 }
 
+impl StartupReport {
+    pub(crate) fn failed(endpoint: usize, kind: FailureKind) -> Self {
+        Self {
+            connected: false,
+            failures: vec![EndpointFailure {
+                endpoint,
+                peer: None,
+                local_ip: None,
+                kind,
+            }],
+        }
+    }
+}
+
 pub(crate) struct ConnectionPool {
     endpoint: usize,
-    address: SocketAddr,
+    pub(crate) local_ip: Option<IpAddr>,
+    peer: SocketAddr,
     uri: Uri,
     connections: Vec<Connection>,
 }
@@ -54,7 +73,8 @@ impl ConnectionPool {
 
         let pool = Self {
             endpoint: index,
-            address: peer,
+            local_ip: settings.local_ip,
+            peer,
             uri,
             connections,
         };
@@ -68,6 +88,7 @@ impl ConnectionPool {
                     Err(kind) => report.failures.push(EndpointFailure {
                         endpoint: index,
                         peer: Some(peer),
+                        local_ip: settings.local_ip,
                         kind,
                     }),
                 }
@@ -77,7 +98,7 @@ impl ConnectionPool {
         })
     }
 
-    fn reserve(&self) -> Result<Reservation, FailureKind> {
+    pub(crate) fn reserve(&self) -> Result<Reservation, FailureKind> {
         loop {
             let mut selected = None;
             let mut failure = FailureKind::Unavailable;
@@ -120,11 +141,10 @@ impl ConnectionPool {
 
     pub(crate) async fn send(
         &self,
+        reservation: Reservation,
         body: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, EndpointFailure> {
-        let reservation = self.reserve().map_err(|kind| self.failure(kind))?;
-
         reservation
             .send(self.uri.clone(), body, deadline)
             .await
@@ -134,7 +154,8 @@ impl ConnectionPool {
     pub(crate) fn failure(&self, kind: FailureKind) -> EndpointFailure {
         EndpointFailure {
             endpoint: self.endpoint,
-            peer: Some(self.address),
+            peer: Some(self.peer),
+            local_ip: self.local_ip,
             kind,
         }
     }

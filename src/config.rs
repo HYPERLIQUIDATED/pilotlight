@@ -1,9 +1,12 @@
-use std::{fmt, time::Duration};
+use std::{fmt, net::IpAddr, time::Duration};
 
 use crate::ConnectError;
 
 pub struct Config {
     pub endpoints: Vec<String>,
+    /// Local source addresses, tried from a rotating starting point. Empty uses system routing.
+    pub local_ips: Vec<IpAddr>,
+    /// Connections per local source and remote IP pair.
     pub connections_per_ip: usize,
     pub reset_stream_capacity: usize,
     pub connect_timeout: Duration,
@@ -17,6 +20,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             endpoints: Vec::new(),
+            local_ips: Vec::new(),
             connections_per_ip: 4,
             reset_stream_capacity: 4096,
             connect_timeout: Duration::from_secs(5),
@@ -32,6 +36,7 @@ impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
             .field("endpoints", &self.endpoints.len())
+            .field("local_ips", &self.local_ips)
             .field("connections_per_ip", &self.connections_per_ip)
             .field("reset_stream_capacity", &self.reset_stream_capacity)
             .field("connect_timeout", &self.connect_timeout)
@@ -47,6 +52,17 @@ impl Config {
     pub(crate) fn validate(&self) -> Result<(), ConnectError> {
         if self.endpoints.is_empty() {
             return Err(ConnectError::InvalidConfig("No endpoints configured"));
+        }
+
+        for (index, ip) in self.local_ips.iter().enumerate() {
+            if ip.is_unspecified() || ip.is_multicast() {
+                return Err(ConnectError::InvalidConfig(
+                    "Local IPs must be unicast source addresses",
+                ));
+            }
+            if self.local_ips[..index].contains(ip) {
+                return Err(ConnectError::InvalidConfig("Local IPs must be unique"));
+            }
         }
 
         if self.connections_per_ip == 0 {

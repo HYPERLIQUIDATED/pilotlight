@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, future::Future, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use hyper::Uri;
@@ -17,6 +23,7 @@ use crate::{
 };
 
 pub(crate) struct Target {
+    local_ips: Arc<[Option<IpAddr>]>,
     uri: Uri,
     host: String,
     port: u16,
@@ -112,14 +119,7 @@ impl Endpoint {
                                 "DNS retry scheduled"
                             );
                             if let Some(initial) = initial.take() {
-                                let _ = initial.send(StartupReport {
-                                    connected: false,
-                                    failures: vec![EndpointFailure {
-                                        endpoint: index,
-                                        peer: None,
-                                        kind,
-                                    }],
-                                });
+                                let _ = initial.send(StartupReport::failed(index, kind));
                             }
 
                             delay
@@ -140,14 +140,9 @@ impl Endpoint {
         });
 
         (endpoint, async move {
-            ready.await.unwrap_or_else(|_| StartupReport {
-                connected: false,
-                failures: vec![EndpointFailure {
-                    endpoint: index,
-                    peer: None,
-                    kind: FailureKind::Transport,
-                }],
-            })
+            ready
+                .await
+                .unwrap_or_else(|_| StartupReport::failed(index, FailureKind::Transport))
         })
     }
 
@@ -155,10 +150,11 @@ impl Endpoint {
         self.pools.borrow().clone()
     }
 
-    pub(crate) fn unavailable(&self) -> EndpointFailure {
+    pub(crate) fn unavailable(&self, local_ip: Option<IpAddr>) -> EndpointFailure {
         EndpointFailure {
             endpoint: self.index,
             peer: None,
+            local_ip,
             kind: FailureKind::Unavailable,
         }
     }
@@ -166,32 +162,41 @@ impl Endpoint {
 
 fn reconcile(
     index: usize,
-    pools: &mut BTreeMap<SocketAddr, Arc<ConnectionPool>>,
+    pools: &mut BTreeMap<(Option<IpAddr>, SocketAddr), Arc<ConnectionPool>>,
     peers: &[SocketAddr],
     target: &Target,
     tls: &Arc<ClientConfig>,
     settings: ConnectionSettings,
     connections_per_ip: usize,
 ) -> FuturesUnordered<impl Future<Output = StartupReport> + use<>> {
-    pools.retain(|peer, _| {
+    pools.retain(|(local_ip, peer), _| {
         let retained = peers.binary_search(peer).is_ok();
         if !retained {
-            tracing::info!(event = "endpoint_address_removed", endpoint = index, %peer, "Endpoint address removed");
+            tracing::info!(event = "endpoint_address_removed", endpoint = index, ?local_ip, %peer, "Endpoint address removed");
         }
         retained
     });
     let connecting = FuturesUnordered::new();
 
-    for &peer in peers {
-        if let std::collections::btree_map::Entry::Vacant(entry) = pools.entry(peer) {
-            tracing::info!(event = "endpoint_address_added", endpoint = index, %peer, "Endpoint address added");
+    for (&peer, &local_ip) in peers.iter().flat_map(|peer| {
+        target
+            .local_ips
+            .iter()
+            .filter(move |local_ip| local_ip.is_none_or(|ip| ip.is_ipv4() == peer.is_ipv4()))
+            .map(move |local_ip| (peer, local_ip))
+    }) {
+        if let std::collections::btree_map::Entry::Vacant(entry) = pools.entry((local_ip, peer)) {
+            tracing::info!(event = "endpoint_address_added", endpoint = index, ?local_ip, %peer, "Endpoint address added");
             let (connection_pool, ready) = ConnectionPool::start(
                 index,
                 peer,
                 target.uri.clone(),
                 &target.transport,
                 tls,
-                settings,
+                ConnectionSettings {
+                    local_ip,
+                    ..settings
+                },
                 connections_per_ip,
             );
             entry.insert(Arc::new(connection_pool));
@@ -222,7 +227,10 @@ async fn lookup(host: &str, port: u16) -> Result<Vec<SocketAddr>, FailureKind> {
 }
 
 impl Target {
-    pub(crate) fn parse(value: &str) -> Result<Self, ConnectError> {
+    pub(crate) fn parse(
+        value: &str,
+        local_ips: Arc<[Option<IpAddr>]>,
+    ) -> Result<Self, ConnectError> {
         let invalid = || {
             ConnectError::InvalidConfig(
                 "Endpoints must be HTTP(S) URLs without credentials or fragments",
@@ -247,6 +255,7 @@ impl Target {
         };
 
         Ok(Self {
+            local_ips,
             uri: url.as_str().parse().map_err(|_| invalid())?,
             host,
             port: url.port_or_known_default().ok_or_else(invalid)?,

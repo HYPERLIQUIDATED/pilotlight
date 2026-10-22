@@ -1,6 +1,6 @@
 use std::{
     future::{Future, poll_fn},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{
         Arc, Mutex,
@@ -17,7 +17,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    net::TcpStream,
+    net::{TcpSocket, TcpStream},
     sync::{oneshot, watch},
     time::{Instant, sleep, timeout_at},
 };
@@ -32,6 +32,7 @@ type Driver = Pin<Box<dyn Future<Output = Result<(), hyper::Error>> + Send>>;
 
 #[derive(Clone, Copy)]
 pub(crate) struct ConnectionSettings {
+    pub local_ip: Option<IpAddr>,
     pub connect_timeout: Duration,
     pub reconnect_min_delay: Duration,
     pub reconnect_max_delay: Duration,
@@ -45,14 +46,12 @@ pub(crate) enum Transport {
     Https(ServerName<'static>),
 }
 
-#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Capacity {
     Unavailable,
     Busy,
     Available { in_flight: usize },
 }
 
-#[derive(Clone, Copy)]
 pub(crate) struct ConnectionId {
     pub endpoint: usize,
     pub peer: SocketAddr,
@@ -174,6 +173,7 @@ async fn maintain(
                 connect_peer(
                     &transport,
                     id.peer,
+                    settings.local_ip,
                     tls.clone(),
                     settings.reset_stream_capacity,
                 ),
@@ -187,6 +187,7 @@ async fn maintain(
                     event = "connection_established",
                     endpoint = id.endpoint,
                     peer = %id.peer,
+                    local_ip = ?settings.local_ip,
                     connection = id.slot,
                     "Connection established"
                 );
@@ -218,6 +219,7 @@ async fn maintain(
                     event = "connection_retry_scheduled",
                     endpoint = id.endpoint,
                     peer = %id.peer,
+                    local_ip = ?settings.local_ip,
                     connection = id.slot,
                     phase,
                     ?error,
@@ -229,6 +231,7 @@ async fn maintain(
                     event = "connection_retry_scheduled",
                     endpoint = id.endpoint,
                     peer = %id.peer,
+                    local_ip = ?settings.local_ip,
                     connection = id.slot,
                     reason = "peer_closed",
                     ?retry_delay,
@@ -250,6 +253,7 @@ async fn maintain(
                 event = "connection_stopped",
                 endpoint = id.endpoint,
                 peer = %id.peer,
+                local_ip = ?settings.local_ip,
                 connection = id.slot,
                 "Connection maintenance stopped"
             );
@@ -261,12 +265,25 @@ async fn maintain(
 async fn connect_peer(
     transport: &Transport,
     peer: SocketAddr,
+    local_ip: Option<IpAddr>,
     tls: Arc<ClientConfig>,
     reset_stream_capacity: usize,
 ) -> Result<(Arc<Session>, Driver), FailureKind> {
-    let tcp = TcpStream::connect(peer)
-        .await
+    let tcp = if let Some(ip) = local_ip {
+        let socket = if ip.is_ipv4() {
+            TcpSocket::new_v4()
+        } else {
+            TcpSocket::new_v6()
+        }
         .map_err(|_| FailureKind::Transport)?;
+        socket
+            .bind(SocketAddr::new(ip, 0))
+            .map_err(|_| FailureKind::Transport)?;
+        socket.connect(peer).await
+    } else {
+        TcpStream::connect(peer).await
+    }
+    .map_err(|_| FailureKind::Transport)?;
     tcp.set_nodelay(true).map_err(|_| FailureKind::Transport)?;
 
     if let Transport::Https(name) = transport {
